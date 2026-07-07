@@ -1,24 +1,51 @@
 /**
- * WaveRadar Fetcher — TikTok via ScrapeCreators (Sumber #2, final)
+ * WaveRadar Fetcher — TikTok via ScrapeCreators v2 (disesuaikan pasar Indonesia)
  *
- * Menggantikan pendekatan scraping langsung (buntu karena butuh signature).
+ * PERUBAHAN dari v1: panggilan #3 (trending feed video lintas-negara — kurang
+ * relevan untuk Indonesia) DIGANTI dengan hashtag per-industri Indonesia,
+ * dirotasi tiap refresh agar semua industri terwakili tanpa boros kredit.
+ *
  * 3 panggilan berbayar per refresh (1 kredit each):
- *   1. Hashtag populer Indonesia (umum)          -> type 'hashtag'
- *   2. Hashtag Indonesia baru naik (newOnBoard)  -> type 'hashtag_new'
- *   3. Trending feed video (lintas negara)       -> type 'video'
+ *   1. Hashtag populer Indonesia (umum)              -> type 'hashtag'
+ *   2. Hashtag Indonesia baru naik (newOnBoard)      -> type 'hashtag_new'
+ *   3. Hashtag Indonesia 1 industri (rotasi)         -> type 'hashtag', +industry
  *
- * Guard: cek kuota harian di PHP SEBELUM memanggil API berbayar,
- * catat pemakaian SESUDAH sukses. Melindungi kredit dari cron dobel.
+ * Rotasi industri ditentukan slot 6-jam-an (0..3) dikombinasi hari,
+ * sehingga 4 refresh/hari menyentuh industri berbeda dan bergilir antar hari.
  *
- * Dipanggil cron-job.org 4x/hari:
- *   GET https://<project>.vercel.app/api/fetch-tiktok-sc?key=<INGEST_SECRET>
- *
- * Env: SCRAPECREATORS_KEY, INGEST_SECRET, INGEST_URL, PHP_API_BASE
- *      SC_BASE_URL (opsional, testing)
+ * Env: SCRAPECREATORS_KEY, INGEST_SECRET, INGEST_URL, PHP_API_BASE, SC_BASE_URL(opsional)
  */
 import { postToIngest, fetchWithChallenge } from '../lib/ingest.js';
 
 const SC_BASE = () => process.env.SC_BASE_URL || 'https://api.scrapecreators.com';
+
+/**
+ * Industri ScrapeCreators yang relevan untuk pasar Indonesia, diurutkan
+ * sebagai daftar rotasi. Label dipakai sebagai konteks pada tren.
+ * (ScrapeCreators memakai slug industri ini pada parameter `industry`.)
+ */
+const SC_INDUSTRIES = [
+  { slug: 'food-and-beverage', label: 'F&B' },
+  { slug: 'beauty-and-personal-care', label: 'Beauty' },
+  { slug: 'apparel-and-accessories', label: 'Fashion' },
+  { slug: 'tech-and-electronics', label: 'Tech' },
+  { slug: 'life-services', label: 'Jasa & Layanan' },
+  { slug: 'health', label: 'Kesehatan' },
+  { slug: 'education', label: 'Edukasi' },
+  { slug: 'travel', label: 'Travel' },
+  { slug: 'vehicle-and-transportation', label: 'Otomotif' },
+  { slug: 'financial-services', label: 'Keuangan' },
+  { slug: 'home-improvement', label: 'Properti & Rumah' },
+  { slug: 'games', label: 'Games & Hiburan' },
+];
+
+/** Pilih industri berdasarkan slot waktu, bergilir & memutar tiap hari. */
+export function pickIndustry(now = new Date()) {
+  const daysSinceEpoch = Math.floor(now.getTime() / 86400000);
+  const slot = Math.floor(now.getUTCHours() / 6); // 0..3 (4 slot/hari)
+  const idx = (daysSinceEpoch * 4 + slot) % SC_INDUSTRIES.length;
+  return SC_INDUSTRIES[idx];
+}
 
 function phpApiBase() {
   if (process.env.PHP_API_BASE) return process.env.PHP_API_BASE.replace(/\/$/, '');
@@ -45,50 +72,40 @@ async function scGet(path) {
   return { http: r.status, json, snippet: json ? null : text.slice(0, 200) };
 }
 
-/** Hashtag populer -> normalisasi. type: 'hashtag' | 'hashtag_new' */
-export function parseHashtags(json, type) {
+/**
+ * Hashtag populer -> normalisasi.
+ * @param type 'hashtag' | 'hashtag_new'
+ * @param industryLabel opsional -> ditambahkan ke konteks & jadi penanda
+ */
+export function parseHashtags(json, type, industryLabel = '') {
   const list = json?.list || json?.data?.list || [];
   return list
     .map((h, i) => {
       const name = h.hashtag_name || h.name || '';
       if (!name) return null;
-      // array trend 7-hari (nilai 0..1) -> konteks momentum ringkas
+
       let momentum = '';
       if (Array.isArray(h.trend) && h.trend.length >= 2) {
         const first = h.trend[0]?.value ?? 0;
         const last = h.trend[h.trend.length - 1]?.value ?? 0;
-        momentum = last >= first ? 'Momentum naik di TikTok (7 hari).' : 'Momentum menurun di TikTok (7 hari).';
+        momentum = last >= first
+          ? 'Momentum naik di TikTok (7 hari).'
+          : 'Momentum menurun di TikTok (7 hari).';
       }
-      const news = momentum ? [{ title: momentum, url: '', snippet: '', source: 'TikTok Creative Center' }] : [];
+
+      const ctxParts = [];
+      if (industryLabel) ctxParts.push(`Hashtag industri ${industryLabel} di TikTok Indonesia.`);
+      if (momentum) ctxParts.push(momentum);
+      const news = ctxParts.length
+        ? [{ title: ctxParts.join(' '), url: '', snippet: '', source: 'TikTok Creative Center' }]
+        : [];
+
       return {
         keyword: '#' + String(name).replace(/^#/, ''),
         type,
         rank: Number(h.rank) || i + 1,
         volume: humanize(h.video_views ?? h.publish_cnt),
         news,
-      };
-    })
-    .filter(Boolean);
-}
-
-/** Trending feed -> video individual (aweme_list). type: 'video' */
-export function parseTrendingVideos(json) {
-  const list = json?.aweme_list || json?.data?.aweme_list || json?.list || [];
-  return list
-    .map((v, i) => {
-      const desc = (v.desc || v.description || '').trim();
-      const author = v.author?.nickname || v.author?.unique_id || '';
-      if (!desc && !author) return null;
-      // Judul kartu: caption dipangkas, fallback ke nama kreator
-      let title = desc || `Video oleh ${author}`;
-      if (title.length > 80) title = title.slice(0, 77) + '…';
-      const stats = v.statistics || {};
-      return {
-        keyword: title,
-        type: 'video',
-        rank: i + 1,
-        volume: humanize(stats.play_count ?? stats.digg_count),
-        news: author ? [{ title: `Kreator: ${author}`, url: '', snippet: '', source: 'TikTok' }] : [],
       };
     })
     .filter(Boolean);
@@ -108,7 +125,7 @@ export default async function handler(req, res) {
   }
   const secret = process.env.INGEST_SECRET;
 
-  // 1) GUARD: cek kuota harian sebelum membakar kredit
+  // 1) GUARD: cek kuota harian
   const guard = await fetchWithChallenge(`${base}/fetch-guard.php?action=check`, {
     headers: { 'X-Ingest-Secret': secret },
   });
@@ -117,17 +134,16 @@ export default async function handler(req, res) {
   }
   if (!guard.body.allowed) {
     return res.status(200).json({
-      ok: true,
-      skipped: true,
+      ok: true, skipped: true,
       reason: 'Kuota fetch harian tercapai — melindungi kredit.',
-      fetches_24h: guard.body.fetches_24h,
-      max_per_day: guard.body.max_per_day,
+      fetches_24h: guard.body.fetches_24h, max_per_day: guard.body.max_per_day,
     });
   }
 
-  // 2) Panggil ScrapeCreators (3 request = 3 kredit)
+  // 2) Tiga panggilan berbayar
   const diagnostics = {};
   let creditsUsed = 0;
+  const industry = pickIndustry(new Date());
 
   const h1 = await scGet('/v1/tiktok/hashtags/popular?countryCode=ID');
   diagnostics.hashtag = { http: h1.http, success: h1.json?.success ?? null, snippet: h1.snippet };
@@ -139,15 +155,16 @@ export default async function handler(req, res) {
   const hashtagsNew = h2.json?.success ? parseHashtags(h2.json, 'hashtag_new') : [];
   if (h2.http === 200) creditsUsed++;
 
-  const v1 = await scGet('/v1/tiktok/get-trending-feed');
-  diagnostics.video = { http: v1.http, snippet: v1.snippet };
-  const videos = (v1.json && (v1.json.aweme_list || v1.json.list)) ? parseTrendingVideos(v1.json) : [];
-  if (v1.http === 200) creditsUsed++;
+  const h3 = await scGet(
+    `/v1/tiktok/hashtags/popular?countryCode=ID&industry=${encodeURIComponent(industry.slug)}`
+  );
+  diagnostics.industry = { slug: industry.slug, http: h3.http, success: h3.json?.success ?? null, snippet: h3.snippet };
+  const hashtagsIndustry = h3.json?.success ? parseHashtags(h3.json, 'hashtag', industry.label) : [];
+  if (h3.http === 200) creditsUsed++;
 
-  const trends = [...hashtags, ...hashtagsNew, ...videos];
+  const trends = [...hashtags, ...hashtagsNew, ...hashtagsIndustry];
 
   if (trends.length === 0) {
-    // Tetap catat kredit yang terpakai (request tetap ditagih walau hasil kosong)
     if (creditsUsed > 0) {
       await fetchWithChallenge(`${base}/fetch-guard.php?action=record`, {
         method: 'POST',
@@ -158,24 +175,23 @@ export default async function handler(req, res) {
     return res.status(502).json({ error: 'ScrapeCreators tidak mengembalikan data', diagnostics });
   }
 
-  // 3) Kirim ke ingest
   const result = await postToIngest(
     process.env.INGEST_URL,
     { source: 'tiktok', captured_at: new Date().toISOString(), trends },
     secret
   );
 
-  // 4) Catat pemakaian kredit (guard)
   await fetchWithChallenge(`${base}/fetch-guard.php?action=record`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Ingest-Secret': secret },
-    body: JSON.stringify({ credits: creditsUsed, note: `${trends.length} tren` }),
+    body: JSON.stringify({ credits: creditsUsed, note: `${trends.length} tren (industri: ${industry.label})` }),
   });
 
   return res.status(result.status === 200 ? 200 : 502).json({
     hashtags: hashtags.length,
     hashtags_new: hashtagsNew.length,
-    videos: videos.length,
+    hashtags_industry: hashtagsIndustry.length,
+    industry_this_run: industry.label,
     credits_used: creditsUsed,
     fetches_24h: guard.body.fetches_24h + 1,
     ingest_status: result.status,
